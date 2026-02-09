@@ -43,13 +43,21 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { type BashOperations, createBashTool, getAgentDir } from "@mariozechner/pi-coding-agent";
+import {
+	type BashOperations,
+	createBashTool,
+	type ExtensionAPI,
+	isToolCallEventType,
+} from "@mariozechner/pi-coding-agent";
+import { isReadBlocked, isWriteBlocked } from "./path-guard.js";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
 	enabled?: boolean;
+	ignoreViolations?: Record<string, string[]>;
+	enableWeakerNestedSandbox?: boolean;
 }
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -78,7 +86,7 @@ const DEFAULT_CONFIG: SandboxConfig = {
 
 function loadConfig(cwd: string): SandboxConfig {
 	const projectConfigPath = join(cwd, ".pi", "sandbox.json");
-	const globalConfigPath = join(getAgentDir(), "extensions", "sandbox.json");
+	const globalConfigPath = join(homedir(), ".pi", "agent", "sandbox.json");
 
 	let globalConfig: Partial<SandboxConfig> = {};
 	let projectConfig: Partial<SandboxConfig> = {};
@@ -113,17 +121,11 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
 		result.filesystem = { ...base.filesystem, ...overrides.filesystem };
 	}
 
-	const extOverrides = overrides as {
-		ignoreViolations?: Record<string, string[]>;
-		enableWeakerNestedSandbox?: boolean;
-	};
-	const extResult = result as { ignoreViolations?: Record<string, string[]>; enableWeakerNestedSandbox?: boolean };
-
-	if (extOverrides.ignoreViolations) {
-		extResult.ignoreViolations = extOverrides.ignoreViolations;
+	if (overrides.ignoreViolations) {
+		result.ignoreViolations = overrides.ignoreViolations;
 	}
-	if (extOverrides.enableWeakerNestedSandbox !== undefined) {
-		extResult.enableWeakerNestedSandbox = extOverrides.enableWeakerNestedSandbox;
+	if (overrides.enableWeakerNestedSandbox !== undefined) {
+		result.enableWeakerNestedSandbox = overrides.enableWeakerNestedSandbox;
 	}
 
 	return result;
@@ -210,11 +212,16 @@ export default function (pi: ExtensionAPI) {
 
 	let sandboxEnabled = false;
 	let sandboxInitialized = false;
+	let sandboxFailed = false;
+	let activeConfig: SandboxConfig = DEFAULT_CONFIG;
 
 	pi.registerTool({
 		...localBash,
 		label: "bash (sandboxed)",
 		async execute(id, params, signal, onUpdate, _ctx) {
+			if (sandboxFailed) {
+				throw new Error("Sandbox initialization failed. Use --no-sandbox to run without protection.");
+			}
 			if (!sandboxEnabled || !sandboxInitialized) {
 				return localBash.execute(id, params, signal, onUpdate);
 			}
@@ -231,6 +238,40 @@ export default function (pi: ExtensionAPI) {
 		return { operations: createSandboxedBashOps() };
 	});
 
+	// Guard in-process file-access tools against sandbox filesystem restrictions
+	pi.on("tool_call", async (event, ctx) => {
+		if (!sandboxEnabled || !sandboxInitialized) return;
+
+		const READ_TOOLS = ["read", "grep", "find", "ls"] as const;
+		const WRITE_TOOLS = ["write", "edit"] as const;
+
+		for (const tool of READ_TOOLS) {
+			if (isToolCallEventType(tool, event)) {
+				const path = event.input.path;
+				if (!path) return;
+				const result = isReadBlocked(path as string, activeConfig, ctx.cwd);
+				if (result.blocked) {
+					ctx.ui.notify(`Sandbox blocked read: ${path}`, "warning");
+					return { block: true, reason: result.reason };
+				}
+				return;
+			}
+		}
+
+		for (const tool of WRITE_TOOLS) {
+			if (isToolCallEventType(tool, event)) {
+				const path = event.input.path;
+				if (!path) return;
+				const result = isWriteBlocked(path as string, activeConfig, ctx.cwd);
+				if (result.blocked) {
+					ctx.ui.notify(`Sandbox blocked write: ${path}`, "warning");
+					return { block: true, reason: result.reason };
+				}
+				return;
+			}
+		}
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
@@ -240,9 +281,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const config = loadConfig(ctx.cwd);
+		activeConfig = loadConfig(ctx.cwd);
 
-		if (!config.enabled) {
+		if (!activeConfig.enabled) {
 			sandboxEnabled = false;
 			ctx.ui.notify("Sandbox disabled via config", "info");
 			return;
@@ -256,23 +297,18 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		try {
-			const configExt = config as unknown as {
-				ignoreViolations?: Record<string, string[]>;
-				enableWeakerNestedSandbox?: boolean;
-			};
-
 			await SandboxManager.initialize({
-				network: config.network,
-				filesystem: config.filesystem,
-				ignoreViolations: configExt.ignoreViolations,
-				enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
+				network: activeConfig.network,
+				filesystem: activeConfig.filesystem,
+				ignoreViolations: activeConfig.ignoreViolations,
+				enableWeakerNestedSandbox: activeConfig.enableWeakerNestedSandbox,
 			});
 
 			sandboxEnabled = true;
 			sandboxInitialized = true;
 
-			const networkCount = config.network?.allowedDomains?.length ?? 0;
-			const writeCount = config.filesystem?.allowWrite?.length ?? 0;
+			const networkCount = activeConfig.network?.allowedDomains?.length ?? 0;
+			const writeCount = activeConfig.filesystem?.allowWrite?.length ?? 0;
 			ctx.ui.setStatus(
 				"sandbox",
 				ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`),
@@ -280,7 +316,11 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Sandbox initialized", "info");
 		} catch (err) {
 			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox initialization failed: ${err instanceof Error ? err.message : err}`, "error");
+			sandboxFailed = true;
+			ctx.ui.notify(
+				`Sandbox init failed: ${err instanceof Error ? err.message : err}. Bash commands will be BLOCKED.`,
+				"error",
+			);
 		}
 	});
 
@@ -298,22 +338,21 @@ export default function (pi: ExtensionAPI) {
 		description: "Show sandbox configuration",
 		handler: async (_args, ctx) => {
 			if (!sandboxEnabled) {
-				ctx.ui.notify("Sandbox is disabled", "info");
+				ctx.ui.notify(`Sandbox is ${sandboxFailed ? "FAILED (bash blocked)" : "disabled"}`, "info");
 				return;
 			}
 
-			const config = loadConfig(ctx.cwd);
 			const lines = [
 				"Sandbox Configuration:",
 				"",
 				"Network:",
-				`  Allowed: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
-				`  Denied: ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
+				`  Allowed: ${activeConfig.network?.allowedDomains?.join(", ") || "(none)"}`,
+				`  Denied: ${activeConfig.network?.deniedDomains?.join(", ") || "(none)"}`,
 				"",
 				"Filesystem:",
-				`  Deny Read: ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,
-				`  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
-				`  Deny Write: ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
+				`  Deny Read: ${activeConfig.filesystem?.denyRead?.join(", ") || "(none)"}`,
+				`  Allow Write: ${activeConfig.filesystem?.allowWrite?.join(", ") || "(none)"}`,
+				`  Deny Write: ${activeConfig.filesystem?.denyWrite?.join(", ") || "(none)"}`,
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
