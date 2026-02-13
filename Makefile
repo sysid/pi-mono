@@ -42,6 +42,10 @@ test-file:  ## run single test file: make test-file F=test/foo.test.ts
 # Code Quality \
 QUALITY:  ## ##################################################################
 
+.PHONY: precommit
+precommit:  ## run all pre-commit hooks
+	.husky/pre-commit
+
 .PHONY: check
 check:  ## run formatting, linting, and type checking
 	npm run check
