@@ -10,6 +10,10 @@ app_root := $(if $(PROJ_DIR),$(PROJ_DIR),$(CURDIR))
 # Developing \
 DEVELOP:  ## ##################################################################
 
+.PHONY: version
+version:  ## version
+	grep version packages/coding-agent/package.json
+
 .PHONY: install
 install:  ## install dependencies
 	npm install
@@ -65,14 +69,14 @@ typecheck:  ## run tsgo type checking
 ################################################################################
 # Building, Deploying \
 BUILDING:  ## ##################################################################
+.PHONY: binary
+binary: install build  ## TW: build pi agent binary to use on local machine
+	cd packages/coding-agent && npm run build:binary
+
 
 .PHONY: build
 build:  ## build all packages (sequential)
 	npm run build
-
-.PHONY: binary
-binary:  ## build pi agent binary
-	cd packages/coding-agent && npm run build:binary
 
 .PHONY: clean
 clean:  ## clean all workspace build artifacts
