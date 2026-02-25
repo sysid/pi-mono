@@ -193,12 +193,12 @@ The extension is designed to fail safely:
 | Scenario | Behavior |
 |----------|----------|
 | Sandbox init succeeds | All restrictions enforced |
-| Sandbox init **fails** | Bash commands are **blocked** (not silently unsandboxed). Error message shown. |
+| Sandbox init **fails** | Bash commands are **blocked**; tool guard remains active. Error message shown. |
 | `--no-sandbox` flag | All restrictions disabled (explicit user choice) |
 | `enabled: false` in config | All restrictions disabled (explicit user choice) |
-| Unsupported platform | Sandbox disabled with warning |
+| Unsupported platform | OS sandbox disabled; tool guard remains active |
 
-If sandbox initialization fails, the agent cannot run bash commands at all. Use `--no-sandbox` to explicitly opt out of protection.
+If sandbox initialization fails, the agent cannot run bash commands at all. Tool guard still applies to built-in tools. Use `--no-sandbox` to explicitly opt out of **all** protection.
 
 ## Known Limitations
 
@@ -222,8 +222,8 @@ Full glob or regex patterns are not supported. `denyRead` uses directory contain
 patterns.
 
 **Platform support**: OS-level sandboxing requires macOS (`sandbox-exec`) or Linux (`bubblewrap`).
-Windows is not supported. The path guard layer works on all platforms but only activates when the
-OS sandbox initializes successfully.
+Windows is not supported. The path guard layer works on all platforms and activates whenever the
+sandbox config is enabled (even if OS sandboxing is unavailable).
 
 ## Manual Test Plan
 
@@ -239,7 +239,7 @@ pi -e ./packages/coding-agent/examples/extensions/sandbox
 /sandbox
 ```
 
-Expected: Config summary showing denyRead, allowWrite, denyWrite entries.
+Expected: Config summary including OS sandbox/tool guard status and denyRead/allowWrite/denyWrite entries.
 
 ### Test 2: Path Guard — Read Denied
 
@@ -373,7 +373,7 @@ pi -e ./packages/coding-agent/examples/extensions/sandbox
 |---------------|----------|
 | Startup notification | Error about sandbox init failure |
 | Ask agent to run any bash command | Error: "Sandbox initialization failed. Use --no-sandbox to run without protection." |
-| `/sandbox` output | "Sandbox is FAILED (bash blocked)" |
+| `/sandbox` output | Status shows OS sandbox FAILED (bash blocked), tool guard enabled |
 
 Clean up: `rm .pi/sandbox.json`
 

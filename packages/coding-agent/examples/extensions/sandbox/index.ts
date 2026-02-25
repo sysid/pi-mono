@@ -58,6 +58,7 @@ interface SandboxConfig extends SandboxRuntimeConfig {
 	enabled?: boolean;
 	ignoreViolations?: Record<string, string[]>;
 	enableWeakerNestedSandbox?: boolean;
+	enableWeakerNetworkIsolation?: boolean;
 }
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -126,6 +127,9 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
 	}
 	if (overrides.enableWeakerNestedSandbox !== undefined) {
 		result.enableWeakerNestedSandbox = overrides.enableWeakerNestedSandbox;
+	}
+	if (overrides.enableWeakerNetworkIsolation !== undefined) {
+		result.enableWeakerNetworkIsolation = overrides.enableWeakerNetworkIsolation;
 	}
 
 	return result;
@@ -213,6 +217,7 @@ export default function (pi: ExtensionAPI) {
 	let sandboxEnabled = false;
 	let sandboxInitialized = false;
 	let sandboxFailed = false;
+	let toolGuardEnabled = false;
 	let activeConfig: SandboxConfig = DEFAULT_CONFIG;
 
 	pi.registerTool({
@@ -240,7 +245,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Guard in-process file-access tools against sandbox filesystem restrictions
 	pi.on("tool_call", async (event, ctx) => {
-		if (!sandboxEnabled || !sandboxInitialized) return;
+		if (!toolGuardEnabled) return;
 
 		const READ_TOOLS = ["read", "grep", "find", "ls"] as const;
 		const WRITE_TOOLS = ["write", "edit"] as const;
@@ -277,6 +282,9 @@ export default function (pi: ExtensionAPI) {
 
 		if (noSandbox) {
 			sandboxEnabled = false;
+			sandboxInitialized = false;
+			sandboxFailed = false;
+			toolGuardEnabled = false;
 			ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
 			return;
 		}
@@ -285,14 +293,20 @@ export default function (pi: ExtensionAPI) {
 
 		if (!activeConfig.enabled) {
 			sandboxEnabled = false;
+			sandboxInitialized = false;
+			sandboxFailed = false;
+			toolGuardEnabled = false;
 			ctx.ui.notify("Sandbox disabled via config", "info");
 			return;
 		}
 
+		toolGuardEnabled = true;
+
 		const platform = process.platform;
 		if (platform !== "darwin" && platform !== "linux") {
 			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+			sandboxInitialized = false;
+			ctx.ui.notify(`OS sandbox not supported on ${platform} (tool guard still active)`, "warning");
 			return;
 		}
 
@@ -302,6 +316,7 @@ export default function (pi: ExtensionAPI) {
 				filesystem: activeConfig.filesystem,
 				ignoreViolations: activeConfig.ignoreViolations,
 				enableWeakerNestedSandbox: activeConfig.enableWeakerNestedSandbox,
+				enableWeakerNetworkIsolation: activeConfig.enableWeakerNetworkIsolation,
 			});
 
 			sandboxEnabled = true;
@@ -318,7 +333,7 @@ export default function (pi: ExtensionAPI) {
 			sandboxEnabled = false;
 			sandboxFailed = true;
 			ctx.ui.notify(
-				`Sandbox init failed: ${err instanceof Error ? err.message : err}. Bash commands will be BLOCKED.`,
+				`Sandbox init failed: ${err instanceof Error ? err.message : err}. Bash commands will be BLOCKED (tool guard still active).`,
 				"error",
 			);
 		}
@@ -337,13 +352,20 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("sandbox", {
 		description: "Show sandbox configuration",
 		handler: async (_args, ctx) => {
-			if (!sandboxEnabled) {
+			if (!sandboxEnabled && !toolGuardEnabled) {
 				ctx.ui.notify(`Sandbox is ${sandboxFailed ? "FAILED (bash blocked)" : "disabled"}`, "info");
 				return;
 			}
 
+			const osStatus = sandboxEnabled ? "enabled" : sandboxFailed ? "FAILED (bash blocked)" : "disabled";
+			const guardStatus = toolGuardEnabled ? "enabled" : "disabled";
+
 			const lines = [
 				"Sandbox Configuration:",
+				"",
+				"Status:",
+				`  OS sandbox: ${osStatus}`,
+				`  Tool guard: ${guardStatus}`,
 				"",
 				"Network:",
 				`  Allowed: ${activeConfig.network?.allowedDomains?.join(", ") || "(none)"}`,
